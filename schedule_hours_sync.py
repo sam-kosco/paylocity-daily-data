@@ -53,14 +53,17 @@ EST = ZoneInfo("America/New_York")
 # ── Auth helpers ───────────────────────────────────────────────────────────────
 
 def get_paylocity_token():
+    import base64
+    client_id     = os.environ["PAYLOCITY_CLIENT_ID"]
+    client_secret = os.environ["PAYLOCITY_CLIENT_SECRET"]
+    credentials   = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
     resp = requests.post(
         PAYLOCITY_TOKEN_URL,
-        data={
-            "grant_type":    "client_credentials",
-            "client_id":     os.environ["PAYLOCITY_CLIENT_ID"],
-            "client_secret": os.environ["PAYLOCITY_CLIENT_SECRET"],
+        data={"grant_type": "client_credentials"},
+        headers={
+            "Content-Type":  "application/x-www-form-urlencoded",
+            "Authorization": f"Basic {credentials}",
         },
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
     )
     resp.raise_for_status()
     return resp.json()["access_token"]
