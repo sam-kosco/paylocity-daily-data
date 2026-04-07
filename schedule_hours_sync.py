@@ -38,6 +38,7 @@ from zoneinfo import ZoneInfo
 
 PAYLOCITY_TOKEN_URL  = "https://dc1prodgwext.paylocity.com/public/security/v1/token"
 PAYLOCITY_BASE       = "https://api.paylocity.com/api"
+PAYLOCITY_HUB_BASE   = "https://dc1prodgwext.paylocity.com"
 COMPANY_ID           = "350673"
 
 GRAPH_TOKEN_URL      = "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
@@ -99,64 +100,121 @@ def paylocity_get(token, path, params=None, retries=3):
 
 def get_shifts_for_employee(token, emp_id, start_dt, end_dt):
     """Return list of shift dicts for one employee over a date range."""
-    path = f"/v2/companies/{COMPANY_ID}/employees/{emp_id}/scheduling/shifts"
+    url = f"{PAYLOCITY_HUB_BASE}/apiHub/scheduling/v1/companies/{COMPANY_ID}/employees/{emp_id}/shifts"
+    start_str = start_dt.strftime("%Y-%m-%dT%H:%M:%S")
+    end_str   = end_dt.strftime("%Y-%m-%dT%H:%M:%S")
     params = {
-        "filter": f"startDateTime ge {start_dt.isoformat()} and startDateTime le {end_dt.isoformat()}",
-        "limit":  200,
+        "filter": f"startDateTime ge {start_str} and startDateTime le {end_str}",
+        "limit":  500,
     }
+    headers = {"Authorization": f"Bearer {token}"}
     try:
-        data = paylocity_get(token, path, params)
-        return data if isinstance(data, list) else data.get("shifts", [])
-    except Exception:
+        for attempt in range(3):
+            resp = requests.get(url, headers=headers, params=params)
+            if resp.status_code == 429:
+                time.sleep(10 * (attempt + 1))
+                continue
+            if resp.status_code in (404, 403):
+                if emp_id == employee_ids_sample[0]:
+                    print(f"    [DEBUG shifts] {resp.status_code} for emp {emp_id}: {resp.text[:200]}")
+                return []
+            resp.raise_for_status()
+            data = resp.json()
+            if emp_id == employee_ids_sample[0]:
+                print(f"    [DEBUG shifts] emp {emp_id} status={resp.status_code} type={type(data).__name__} len={len(data) if isinstance(data, list) else list(data.keys())[:4]}")
+            return data if isinstance(data, list) else data.get("shifts", [])
+    except Exception as e:
+        if emp_id == employee_ids_sample[0]:
+            print(f"    [DEBUG shifts] exception for emp {emp_id}: {e}")
         return []
+    return []
 
 
 def get_punch_details_for_employee(token, emp_id, relative_start, relative_end):
     """
     Return aggregated punch data for one employee.
-    relative_start / relative_end: ISO datetime strings in EST.
+    relative_start / relative_end: naive datetime strings (no tz), EST assumed by Paylocity.
     Returns list of {date, hours_worked, labor_dist, work_scope, earnings}.
+
+    Response structure: array of WorkedShift objects, each with a segments[] array.
+    Each segment has: date, durationHours, earnings, costCenters[], punchType.
+    We aggregate all segments per date (excluding non-work types like Lunch).
     """
-    path = f"/apiHub/time/v2/companies/{COMPANY_ID}/employees/{emp_id}/punchdetails"
-    params = {
-        "relativeStart": relative_start,
-        "relativeEnd":   relative_end,
-    }
+    url = f"{PAYLOCITY_HUB_BASE}/apiHub/time/v2/companies/{COMPANY_ID}/employees/{emp_id}/punchdetails"
+    # Strip timezone info — API expects naive local time
+    start_str = relative_start[:19] if len(relative_start) >= 19 else relative_start
+    end_str   = relative_end[:19]   if len(relative_end) >= 19   else relative_end
+    params = {"startDate": start_str, "endDate": end_str}
+    headers = {"Authorization": f"Bearer {token}"}
+
     try:
-        data = paylocity_get(token, path, params)
-        punches = data if isinstance(data, list) else data.get("punchDetails", [])
-    except Exception:
+        for attempt in range(3):
+            resp = requests.get(url, headers=headers, params=params)
+            if resp.status_code == 429:
+                time.sleep(10 * (attempt + 1))
+                continue
+            if resp.status_code in (404, 403):
+                if emp_id == employee_ids_sample[0]:
+                    print(f"    [DEBUG punch] {resp.status_code} for emp {emp_id}: {resp.text[:200]}")
+                return []
+            resp.raise_for_status()
+            worked_shifts = resp.json()
+            if emp_id == employee_ids_sample[0]:
+                print(f"    [DEBUG punch] emp {emp_id} status={resp.status_code} type={type(worked_shifts).__name__} len={len(worked_shifts) if isinstance(worked_shifts, list) else list(worked_shifts.keys())[:4]}")
+                if isinstance(worked_shifts, list) and len(worked_shifts) > 0:
+                    print(f"    [DEBUG punch] first item keys: {list(worked_shifts[0].keys())}")
+            break
+        else:
+            return []
+    except Exception as e:
+        if emp_id == employee_ids_sample[0]:
+            print(f"    [DEBUG punch] exception for emp {emp_id}: {e}")
         return []
 
-    # Aggregate by date — only Clock Out punches carry duration/earnings
-    by_date = {}
-    for p in punches:
-        if p.get("punchType") not in ("ClockOut", "Clock Out"):
-            continue
-        raw_date = p.get("punchDate", "")[:10]
-        if not raw_date:
-            continue
-        if raw_date not in by_date:
-            by_date[raw_date] = {
-                "date":          raw_date,
-                "hours_worked":  0.0,
-                "labor_dist":    "",
-                "work_scope":    "",
-                "earnings":      0.0,
-            }
-        duration_mins = p.get("duration") or 0
-        by_date[raw_date]["hours_worked"] += round(duration_mins / 60, 4)
-        by_date[raw_date]["earnings"]     += p.get("earnings") or 0
+    if not isinstance(worked_shifts, list):
+        return []
 
-        # Use cost center from first punch that has one
-        ccs = p.get("costCenters", [])
-        for cc in ccs:
-            level = cc.get("level")
-            code  = cc.get("code", "")
-            if level == 0 and not by_date[raw_date]["labor_dist"]:
-                by_date[raw_date]["labor_dist"] = code
-            if level == 1 and not by_date[raw_date]["work_scope"]:
-                by_date[raw_date]["work_scope"] = code
+    # Aggregate segments by date
+    by_date = {}
+    non_work_types = {"Lunch", "Break", "NonWork", "Non Work", "Unpaid"}
+
+    for shift in worked_shifts:
+        segments = shift.get("segments") or []
+        for seg in segments:
+            # Skip non-work segments
+            punch_type = seg.get("punchType") or ""
+            if any(t.lower() in punch_type.lower() for t in non_work_types):
+                continue
+
+            raw_date = (seg.get("date") or "")[:10]
+            if not raw_date:
+                continue
+
+            if raw_date not in by_date:
+                by_date[raw_date] = {
+                    "date":         raw_date,
+                    "hours_worked": 0.0,
+                    "labor_dist":   "",
+                    "work_scope":   "",
+                    "earnings":     0.0,
+                }
+
+            by_date[raw_date]["hours_worked"] += seg.get("durationHours") or 0
+            by_date[raw_date]["earnings"]     += seg.get("earnings") or 0
+
+            # Cost centers — use first occurrence per level
+            for cc in (seg.get("costCenters") or []):
+                level = cc.get("level")
+                code  = cc.get("code") or ""
+                if level == 0 and not by_date[raw_date]["labor_dist"]:
+                    by_date[raw_date]["labor_dist"] = code
+                if level == 1 and not by_date[raw_date]["work_scope"]:
+                    by_date[raw_date]["work_scope"] = code
+
+    # Round after aggregation
+    for d in by_date.values():
+        d["hours_worked"] = round(d["hours_worked"], 2)
+        d["earnings"]     = round(d["earnings"], 2)
 
     return list(by_date.values())
 
@@ -260,6 +318,7 @@ def main():
 
     # ── SCHEDULE: fetch and upsert ────────────────────────────────────────────
     print(f"\nFetching schedule ({sched_start} → {sched_end})...")
+    employee_ids_sample = employee_ids[:1]  # used for debug logging in API functions
 
     sched_start_dt = datetime(sched_start.year, sched_start.month, sched_start.day,
                                tzinfo=EST)
@@ -339,6 +398,7 @@ def main():
 
     # ── LABOR HOURS: fetch and upsert ─────────────────────────────────────────
     print(f"\nFetching labor hours ({labor_update_start} → {today})...")
+    employee_ids_sample = employee_ids[:1]
 
     labor_start_dt = datetime(labor_update_start.year, labor_update_start.month,
                                labor_update_start.day, tzinfo=EST)
@@ -417,10 +477,8 @@ def main():
 
     def write_sheet(wb, sheet_name, df, header_fill_hex="1B2D6B"):
         if sheet_name in wb.sheetnames:
-            ws = wb[sheet_name]
-            ws.delete_rows(1, ws.max_row)
-        else:
-            ws = wb.create_sheet(sheet_name)
+            del wb[sheet_name]
+        ws = wb.create_sheet(sheet_name)
 
         header_fill = PatternFill("solid", fgColor=header_fill_hex)
         header_font = Font(bold=True, color="FFFFFF", name="Calibri", size=11)
@@ -430,8 +488,8 @@ def main():
         # Write header
         for col_idx, col_name in enumerate(df.columns, 1):
             cell = ws.cell(row=1, column=col_idx, value=col_name)
-            cell.font    = header_font
-            cell.fill    = header_fill
+            cell.font      = header_font
+            cell.fill      = header_fill
             cell.alignment = header_align
 
         # Write data rows
@@ -440,16 +498,13 @@ def main():
                 cell = ws.cell(row=row_idx, column=col_idx, value=val)
                 cell.font = body_font
 
-        # Auto-size columns
+        # Auto-size columns — safe for empty dataframes
         for col_idx, col_name in enumerate(df.columns, 1):
-            max_len = max(
-                len(str(col_name)),
-                *(len(str(v)) for v in df.iloc[:, col_idx - 1] if pd.notna(v)),
-                default=len(col_name),
-            )
-            ws.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 3, 40)
+            lengths = [len(str(col_name))]
+            if len(df) > 0:
+                lengths += [len(str(v)) for v in df.iloc[:, col_idx - 1] if v is not None and str(v) != "nan"]
+            ws.column_dimensions[get_column_letter(col_idx)].width = min(max(lengths) + 3, 40)
 
-        # Freeze header row
         ws.freeze_panes = "A2"
 
     write_sheet(wb, "Schedule",     final_sched,  header_fill_hex="1B2D6B")
