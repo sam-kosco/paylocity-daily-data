@@ -98,8 +98,11 @@ def paylocity_get(token, path, params=None, retries=3):
     raise RuntimeError(f"Failed after {retries} retries: {path}")
 
 
+_shifts_logged = False
+
 def get_shifts_for_employee(token, emp_id, start_dt, end_dt):
     """Return list of shift dicts for one employee over a date range."""
+    global _shifts_logged
     url = f"{PAYLOCITY_HUB_BASE}/apiHub/scheduling/v1/companies/{COMPANY_ID}/employees/{emp_id}/shifts"
     start_str = start_dt.strftime("%Y-%m-%dT%H:%M:%S")
     end_str   = end_dt.strftime("%Y-%m-%dT%H:%M:%S")
@@ -114,21 +117,23 @@ def get_shifts_for_employee(token, emp_id, start_dt, end_dt):
             if resp.status_code == 429:
                 time.sleep(10 * (attempt + 1))
                 continue
-            if resp.status_code in (404, 403):
-                if emp_id == employee_ids_sample[0]:
-                    print(f"    [DEBUG shifts] {resp.status_code} for emp {emp_id}: {resp.text[:200]}")
+            if not _shifts_logged:
+                print(f"    [DEBUG shifts] emp {emp_id} status={resp.status_code} body={resp.text[:300]}")
+                _shifts_logged = True
+            if resp.status_code in (400, 403, 404):
                 return []
             resp.raise_for_status()
             data = resp.json()
-            if emp_id == employee_ids_sample[0]:
-                print(f"    [DEBUG shifts] emp {emp_id} status={resp.status_code} type={type(data).__name__} len={len(data) if isinstance(data, list) else list(data.keys())[:4]}")
             return data if isinstance(data, list) else data.get("shifts", [])
     except Exception as e:
-        if emp_id == employee_ids_sample[0]:
+        if not _shifts_logged:
             print(f"    [DEBUG shifts] exception for emp {emp_id}: {e}")
+            _shifts_logged = True
         return []
     return []
 
+
+_punch_logged = False
 
 def get_punch_details_for_employee(token, emp_id, relative_start, relative_end):
     """
@@ -140,6 +145,7 @@ def get_punch_details_for_employee(token, emp_id, relative_start, relative_end):
     Each segment has: date, durationHours, earnings, costCenters[], punchType.
     We aggregate all segments per date (excluding non-work types like Lunch).
     """
+    global _punch_logged
     url = f"{PAYLOCITY_HUB_BASE}/apiHub/time/v2/companies/{COMPANY_ID}/employees/{emp_id}/punchdetails"
     # Strip timezone info — API expects naive local time
     start_str = relative_start[:19] if len(relative_start) >= 19 else relative_start
@@ -153,22 +159,24 @@ def get_punch_details_for_employee(token, emp_id, relative_start, relative_end):
             if resp.status_code == 429:
                 time.sleep(10 * (attempt + 1))
                 continue
-            if resp.status_code in (404, 403):
-                if emp_id == employee_ids_sample[0]:
-                    print(f"    [DEBUG punch] {resp.status_code} for emp {emp_id}: {resp.text[:200]}")
+            if not _punch_logged:
+                print(f"    [DEBUG punch] emp {emp_id} status={resp.status_code} body={resp.text[:300]}")
+                _punch_logged = True
+            if resp.status_code in (400, 403, 404):
                 return []
             resp.raise_for_status()
             worked_shifts = resp.json()
-            if emp_id == employee_ids_sample[0]:
-                print(f"    [DEBUG punch] emp {emp_id} status={resp.status_code} type={type(worked_shifts).__name__} len={len(worked_shifts) if isinstance(worked_shifts, list) else list(worked_shifts.keys())[:4]}")
-                if isinstance(worked_shifts, list) and len(worked_shifts) > 0:
-                    print(f"    [DEBUG punch] first item keys: {list(worked_shifts[0].keys())}")
+            if _punch_logged and not isinstance(worked_shifts, list):
+                print(f"    [DEBUG punch] unexpected type: {type(worked_shifts)} keys={list(worked_shifts.keys())[:5]}")
+            elif _punch_logged and len(worked_shifts) > 0:
+                print(f"    [DEBUG punch] first item keys: {list(worked_shifts[0].keys())}")
             break
         else:
             return []
     except Exception as e:
-        if emp_id == employee_ids_sample[0]:
-            print(f"    [DEBUG punch] exception for emp {emp_id}: {e}")
+        if not _punch_logged:
+            print(f"    [DEBUG punch] exception: {e}")
+            _punch_logged = True
         return []
 
     if not isinstance(worked_shifts, list):
@@ -318,7 +326,6 @@ def main():
 
     # ── SCHEDULE: fetch and upsert ────────────────────────────────────────────
     print(f"\nFetching schedule ({sched_start} → {sched_end})...")
-    employee_ids_sample = employee_ids[:1]  # used for debug logging in API functions
 
     sched_start_dt = datetime(sched_start.year, sched_start.month, sched_start.day,
                                tzinfo=EST)
@@ -398,7 +405,6 @@ def main():
 
     # ── LABOR HOURS: fetch and upsert ─────────────────────────────────────────
     print(f"\nFetching labor hours ({labor_update_start} → {today})...")
-    employee_ids_sample = employee_ids[:1]
 
     labor_start_dt = datetime(labor_update_start.year, labor_update_start.month,
                                labor_update_start.day, tzinfo=EST)
